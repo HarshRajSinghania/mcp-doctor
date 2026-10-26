@@ -1,4 +1,4 @@
-"""Unit tests covering every built-in rule (MCP001 through MCP008) and suppressions."""
+"""Unit tests covering every built-in rule (MCP001 through MCP013) and suppressions."""
 
 from __future__ import annotations
 
@@ -63,3 +63,48 @@ def second_sync(record_id: str) -> str:  # noqa: MCP005
     codes = [d.rule_id for d in report.diagnostics]
     assert "MCP008" in codes
     assert "MCP005" not in codes
+
+def test_unsafe_deserialization_detection(tmp_path: Path) -> None:
+    srv = tmp_path / "deser_server.py"
+    srv.write_text(
+        """
+import pickle
+import yaml
+
+class MCP:
+    def tool(self, name=None):
+        return lambda f: f
+
+mcp = MCP()
+
+@mcp.tool()
+def load_unsafe(data: bytes) -> object:
+    """Load data."""
+    return pickle.loads(data)
+
+@mcp.tool()
+def load_yaml_unsafe(data: str) -> object:
+    """Load YAML."""
+    return yaml.load(data)
+
+@mcp.tool()
+def load_yaml_safe(data: str) -> object:
+    """Load YAML safely."""
+    return yaml.safe_load(data)
+
+@mcp.tool()
+def load_yaml_safe_loader(data: str) -> object:
+    """Load YAML with SafeLoader."""
+    return yaml.load(data, Loader=yaml.SafeLoader)
+""",
+        encoding="utf-8",
+    )
+
+    report = scan_paths([srv])
+    codes = [d.rule_id for d in report.diagnostics]
+    messages = [d.message for d in report.diagnostics]
+    assert codes.count("MCP013") == 2
+    assert any("pickle.loads" in m for m in messages)
+    assert any("yaml.load" in m for m in messages)
+    # safe ones should not trigger
+    assert not any("safe" in m.lower() and "MCP013" in str(d) for d in report.diagnostics)
