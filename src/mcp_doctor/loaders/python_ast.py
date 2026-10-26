@@ -52,14 +52,6 @@ _FS_DESTRUCTIVE_CALLS = frozenset(
     }
 )
 
-_UNSAFE_DESER_CALLS = frozenset({
-    "pickle.loads",
-    "pickle.load",
-    "marshal.loads",
-    "shelve.open",
-})
-
-
 
 def _call_qualname(node: ast.expr) -> str:
     if isinstance(node, ast.Name):
@@ -193,19 +185,6 @@ def _body_clamps_param(func: ast.FunctionDef | ast.AsyncFunctionDef, param_name:
     return False
 
 
-
-def _is_safe_yaml_load(node: ast.Call) -> bool:
-    """Return True if yaml.load is called with a SafeLoader."""
-    for kw in node.keywords:
-        if kw.arg == "Loader":
-            loader_name = _call_qualname(kw.value)
-            if "SafeLoader" in loader_name:
-                return True
-            if isinstance(kw.value, ast.Attribute) and kw.value.attr == "SafeLoader":
-                return True
-    return False
-
-
 def _extract_sinks(
     func: ast.FunctionDef | ast.AsyncFunctionDef,
     param_names: set[str],
@@ -292,19 +271,7 @@ def _extract_sinks(
                 )
             )
 
-    
-        elif qual in _UNSAFE_DESER_CALLS or (qual == "yaml.load" and not _is_safe_yaml_load(node)):
-            sinks.append(
-                CodeSink(
-                    kind="deserialization",
-                    call_name=qual,
-                    line=node.lineno,
-                    uses_param=first_param,
-                    validated=False,
-                )
-            )
-
-return tuple(sinks)
+    return tuple(sinks)
 
 
 def _extract_suppressions(lines: list[str], start_line: int, end_line: int) -> frozenset[str]:
