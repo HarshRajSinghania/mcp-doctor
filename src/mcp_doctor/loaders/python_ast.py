@@ -1,0 +1,403 @@
+"""Python AST loader for FastMCP, official MCP SDK, and @tool-decorated agent tools."""
+
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+
+from mcp_doctor.models import CodeSink, ParameterSpec, ToolSpec
+from mcp_doctor.tokens import estimate_tool_tokens
+
+_NOQA_RE = re.compile(r"#\s*noqa\s*:\s*([A-Za-z0-9_,\s]+)", re.IGNORECASE)
+_PARAM_DOC_RE = re.compile(r"^\s*:?param\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+)$")
+_GOOGLE_ARG_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^)]*\))?\s*:\s*(.+)$")
+
+_SKIP_PARAM_NAMES = frozenset({"self", "cls", "ctx", "context"})
+
+_SHELL_CALLS = frozenset({"os.system", "os.popen", "pty.spawn", "eval", "exec"})
+_SUBPROCESS_CALLS = frozenset(
+    {
+        "subprocess.run",
+        "subprocess.Popen",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+    }
+)
+_HTTP_CALLS = frozenset(
+    {
+        "urllib.request.urlopen",
+        "urlopen",
+        "requests.get",
+        "requests.post",
+        "requests.put",
+        "requests.delete",
+        "requests.request",
+        "httpx.get",
+        "httpx.post",
+        "httpx.AsyncClient.get",
+        "httpx.AsyncClient.post",
+    }
+)
+_FS_DESTRUCTIVE_CALLS = frozenset(
+    {
+        "os.remove",
+        "os.unlink",
+        "os.rmdir",
+        "shutil.rmtree",
+        "Path.unlink",
+        "Path.write_text",
+        "Path.write_bytes",
+    }
+)
+
+
+def _call_qualname(node: ast.expr) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _call_qualname(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return ""
+
+
+def _is_tool_decorator(dec: ast.expr) -> tuple[bool, str | None, str | None]:
+    """Return (is_tool, custom_name, custom_description) for a function decorator."""
+    target = dec.func if isinstance(dec, ast.Call) else dec
+    qual = _call_qualname(target)
+    leaf = qual.split(".")[-1] if qual else ""
+    if leaf not in {"tool", "mcp_tool", "function_tool"}:
+        return False, None, None
+
+    custom_name: str | None = None
+    custom_desc: str | None = None
+    if isinstance(dec, ast.Call):
+        if (
+            dec.args
+            and isinstance(dec.args[0], ast.Constant)
+            and isinstance(dec.args[0].value, str)
+        ):
+            custom_name = dec.args[0].value
+        for kw in dec.keywords:
+            if (
+                kw.arg == "name"
+                and isinstance(kw.value, ast.Constant)
+                and isinstance(kw.value.value, str)
+            ):
+                custom_name = kw.value.value
+            elif (
+                kw.arg == "description"
+                and isinstance(kw.value, ast.Constant)
+                and isinstance(kw.value.value, str)
+            ):
+                custom_desc = kw.value.value
+    return True, custom_name, custom_desc
+
+
+def _extract_param_docs(docstring: str) -> dict[str, str]:
+    docs: dict[str, str] = {}
+    in_args_section = False
+    for raw_line in docstring.splitlines():
+        stripped = raw_line.strip()
+        if stripped in {"Args:", "Arguments:", "Parameters:"}:
+            in_args_section = True
+            continue
+        if stripped.endswith(":") and stripped[:-1] in {
+            "Returns",
+            "Raises",
+            "Yields",
+            "Examples",
+            "Notes",
+        }:
+            in_args_section = False
+            continue
+
+        m_sphinx = _PARAM_DOC_RE.match(raw_line)
+        if m_sphinx:
+            docs[m_sphinx.group(1)] = m_sphinx.group(2).strip()
+            continue
+
+        if in_args_section:
+            m_google = _GOOGLE_ARG_RE.match(raw_line)
+            if m_google:
+                docs[m_google.group(1)] = m_google.group(2).strip()
+    return docs
+
+
+def _annotation_info(ann: ast.expr | None) -> tuple[str | None, bool]:
+    """Return (normalized_type_string, has_explicit_bounds)."""
+    if ann is None:
+        return None, False
+    rendered = ast.unparse(ann)
+    has_bounds = any(
+        token in rendered
+        for token in (
+            "max_length",
+            "max_items",
+            "le=",
+            "lt=",
+            "ge=",
+            "gt=",
+            "Literal[",
+            "MaxLen",
+        )
+    )
+    return rendered, has_bounds
+
+
+def _referenced_names(node: ast.AST) -> set[str]:
+    return {sub.id for sub in ast.walk(node) if isinstance(sub, ast.Name)}
+
+
+def _body_has_url_validation(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    src = ast.unparse(func)
+    return any(
+        marker in src
+        for marker in (
+            "urlparse",
+            "urlsplit",
+            "ALLOWED_HOSTS",
+            "allowlist",
+            "startswith(('https://'",
+        )
+    )
+
+
+def _body_has_path_confinement(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    src = ast.unparse(func)
+    return any(
+        marker in src
+        for marker in (".resolve()", "is_relative_to", "commonpath", "BASE_DIR", "SAFE_DIR")
+    )
+
+
+def _body_clamps_param(func: ast.FunctionDef | ast.AsyncFunctionDef, param_name: str) -> bool:
+    for node in ast.walk(func):
+        if (
+            isinstance(node, ast.Call)
+            and _call_qualname(node.func) == "min"
+            and param_name in _referenced_names(node)
+        ):
+            return True
+        if isinstance(node, ast.Compare) and param_name in _referenced_names(node):
+            return True
+    return False
+
+
+def _extract_sinks(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+    param_names: set[str],
+) -> tuple[CodeSink, ...]:
+    sinks: list[CodeSink] = []
+    has_url_guard = _body_has_url_validation(func)
+    has_path_guard = _body_has_path_confinement(func)
+
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Call):
+            continue
+        qual = _call_qualname(node.func)
+        used_params = sorted(_referenced_names(node) & param_names)
+        first_param = used_params[0] if used_params else None
+
+        if qual in _SHELL_CALLS:
+            sinks.append(
+                CodeSink(
+                    kind="shell",
+                    call_name=qual,
+                    line=node.lineno,
+                    uses_param=first_param,
+                    validated=False,
+                )
+            )
+        elif qual in _SUBPROCESS_CALLS:
+            shell_true = any(
+                kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+                for kw in node.keywords
+            )
+            if shell_true:
+                sinks.append(
+                    CodeSink(
+                        kind="shell",
+                        call_name=f"{qual}(shell=True)",
+                        line=node.lineno,
+                        uses_param=first_param,
+                        validated=False,
+                    )
+                )
+        elif (qual in _HTTP_CALLS or qual.endswith((".get", ".post"))) and first_param:
+            if qual in _HTTP_CALLS or any(
+                client in qual for client in ("requests", "httpx", "urllib", "client", "session")
+            ):
+                sinks.append(
+                    CodeSink(
+                        kind="ssrf",
+                        call_name=qual,
+                        line=node.lineno,
+                        uses_param=first_param,
+                        validated=has_url_guard,
+                    )
+                )
+        elif qual == "open" and first_param:
+            is_write = False
+            if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                mode = str(node.args[1].value)
+                is_write = any(flag in mode for flag in ("w", "a", "x", "+"))
+            for kw in node.keywords:
+                if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                    mode = str(kw.value.value)
+                    is_write = any(flag in mode for flag in ("w", "a", "x", "+"))
+            # Even read-mode open on unvalidated user paths can leak `/etc/passwd` or secrets
+            sinks.append(
+                CodeSink(
+                    kind="filesystem",
+                    call_name="open(write)" if is_write else "open",
+                    line=node.lineno,
+                    uses_param=first_param,
+                    validated=has_path_guard,
+                )
+            )
+        elif (
+            qual in _FS_DESTRUCTIVE_CALLS
+            or qual.endswith((".write_text", ".write_bytes", ".unlink"))
+        ) and first_param:
+            sinks.append(
+                CodeSink(
+                    kind="filesystem",
+                    call_name=qual,
+                    line=node.lineno,
+                    uses_param=first_param,
+                    validated=has_path_guard,
+                )
+            )
+
+    return tuple(sinks)
+
+
+def _extract_suppressions(lines: list[str], start_line: int, end_line: int) -> frozenset[str]:
+    suppressed: set[str] = set()
+    lo = max(0, start_line - 2)
+    hi = min(len(lines), end_line)
+    for line in lines[lo:hi]:
+        m = _NOQA_RE.search(line)
+        if m:
+            for code in m.group(1).split(","):
+                cleaned = code.strip().upper()
+                if cleaned:
+                    suppressed.add(cleaned)
+    return frozenset(suppressed)
+
+
+def load_python_file(path: Path) -> list[ToolSpec]:
+    """Parse a Python source file and return all discovered MCP / agent ToolSpecs."""
+    source = path.read_text(encoding="utf-8")
+    lines = source.splitlines()
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError:
+        return []
+
+    tools: list[ToolSpec] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            matched = False
+            custom_name: str | None = None
+            custom_desc: str | None = None
+            for dec in node.decorator_list:
+                ok, dec_name, dec_desc = _is_tool_decorator(dec)
+                if ok:
+                    matched = True
+                    custom_name = dec_name or custom_name
+                    custom_desc = dec_desc or custom_desc
+            if not matched:
+                continue
+
+            tool_name = custom_name or node.name
+            docstring = ast.get_docstring(node) or ""
+            description = custom_desc if custom_desc is not None else docstring
+            param_docs = _extract_param_docs(docstring)
+
+            all_args = (
+                list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
+            )
+            num_pos = len(node.args.posonlyargs) + len(node.args.args)
+            num_defaults = len(node.args.defaults)
+            default_start = num_pos - num_defaults
+
+            params: list[ParameterSpec] = []
+            user_param_names: set[str] = set()
+
+            for idx, arg in enumerate(all_args):
+                if arg.arg in _SKIP_PARAM_NAMES:
+                    continue
+                type_str, ann_bounded = _annotation_info(arg.annotation)
+                if type_str and any(ctx_t in type_str for ctx_t in ("Context", "RequestContext")):
+                    continue
+                user_param_names.add(arg.arg)
+                if idx < num_pos:
+                    has_default = idx >= default_start
+                else:
+                    kw_idx = idx - num_pos
+                    has_default = (
+                        kw_idx < len(node.args.kw_defaults)
+                        and node.args.kw_defaults[kw_idx] is not None
+                    )
+                clamped = ann_bounded or _body_clamps_param(node, arg.arg)
+                params.append(
+                    ParameterSpec(
+                        name=arg.arg,
+                        type_name=type_str,
+                        description=param_docs.get(arg.arg, ""),
+                        required=not has_default,
+                        has_bounds=clamped,
+                        line=arg.lineno,
+                    )
+                )
+
+            sinks = _extract_sinks(node, user_param_names)
+            end_lineno = getattr(node, "end_lineno", node.lineno) or node.lineno
+            suppressed = _extract_suppressions(lines, node.lineno, end_lineno)
+            param_tuple = tuple(params)
+            est_tokens = estimate_tool_tokens(tool_name, description, param_tuple)
+
+            tools.append(
+                ToolSpec(
+                    name=tool_name,
+                    description=description,
+                    source_file=str(path),
+                    line=node.lineno,
+                    parameters=param_tuple,
+                    sinks=sinks,
+                    suppressed_rules=suppressed,
+                    estimated_tokens=est_tokens,
+                )
+            )
+
+        elif isinstance(node, ast.Call) and _call_qualname(node.func).split(".")[-1] == "Tool":
+            kw_map = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+            name_node = kw_map.get("name")
+            if not (isinstance(name_node, ast.Constant) and isinstance(name_node.value, str)):
+                continue
+            desc_node = kw_map.get("description")
+            desc_val = (
+                desc_node.value
+                if isinstance(desc_node, ast.Constant) and isinstance(desc_node.value, str)
+                else ""
+            )
+            end_lineno = getattr(node, "end_lineno", node.lineno) or node.lineno
+            suppressed = _extract_suppressions(lines, node.lineno, end_lineno)
+            est_tokens = estimate_tool_tokens(name_node.value, desc_val, ())
+            tools.append(
+                ToolSpec(
+                    name=name_node.value,
+                    description=desc_val,
+                    source_file=str(path),
+                    line=node.lineno,
+                    suppressed_rules=suppressed,
+                    estimated_tokens=est_tokens,
+                )
+            )
+
+    tools.sort(key=lambda t: t.line)
+    return tools
